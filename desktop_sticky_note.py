@@ -3,6 +3,8 @@ import json
 import time
 import tkinter as tk
 from pathlib import Path
+import sys
+import winreg
 from tkinter import colorchooser, simpledialog
 from tkinter import font as tkfont
 from ctypes import wintypes
@@ -43,6 +45,32 @@ WNDPROC = ctypes.WINFUNCTYPE(
 )
 
 
+def enable_dpi_awareness() -> None:
+    # Request modern DPI awareness so Windows doesn't bitmap-scale the app.
+    # Bitmap scaling is a common cause of blurry/color-fringed text.
+    try:
+        user32 = ctypes.windll.user32
+        # DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = -4
+        result = user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4))
+        if result:
+            return
+    except Exception:
+        pass
+
+    try:
+        # Windows 8.1 fallback
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)
+        return
+    except Exception:
+        pass
+
+    try:
+        # Legacy fallback
+        ctypes.windll.user32.SetProcessDPIAware()
+    except Exception:
+        pass
+
+
 class NOTIFYICONDATAW(ctypes.Structure):
     _fields_ = [
         ("cbSize", wintypes.DWORD),
@@ -72,12 +100,24 @@ class GdiplusStartupInput(ctypes.Structure):
     ]
 
 
+def app_base_dir() -> Path:
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+
+def config_dir() -> Path:
+    d = app_base_dir() / "desktopStickNote_config"
+    d.mkdir(exist_ok=True)
+    return d
+
+
 def app_storage_path() -> Path:
-    return Path(__file__).resolve().with_name("sticky_note.txt")
+    return config_dir() / "sticky_note.txt"
 
 
 def config_storage_path() -> Path:
-    return Path(__file__).resolve().with_name("sticky_note_config.json")
+    return config_dir() / "sticky_note_config.json"
 
 
 def shade_color(hex_color: str, factor: float = 0.85) -> str:
@@ -136,13 +176,14 @@ class DesktopStickyNoteApp:
         self.text_changed = False
         self.file_path = app_storage_path()
         self.config_path = config_storage_path()
-        self.logo_png_path = Path(__file__).resolve().with_name("logo.png")
-        self.logo_ico_path = Path(__file__).resolve().with_name("logo.ico")
+        self.logo_png_path = config_dir() / "logo.png"
+        self.logo_ico_path = config_dir() / "logo.ico"
         self.font_family = pick_default_font_family()
         self.font_size = 13
         self.font_color = "#1A1A1A"
         self.background_color = "#FFF8B8"
         self.window_geometry = "420x300+80+80"
+        self.startup_enabled = tk.BooleanVar(value=True)
         self.pin_to_top_enabled = tk.BooleanVar(value=False)
         self.tray_icon_enabled = tk.BooleanVar(value=True)
         self.tray_icon_visible = False
@@ -170,6 +211,9 @@ class DesktopStickyNoteApp:
         self._original_wndproc = None
         self._wndproc_ref = None
         self.selection_color = blend_colors(self.background_color, "#000000", 0.20)
+        self._pending_tray_left_click = False
+        self._pending_tray_right_click = False
+        self._force_hidden_by_tray = False
 
         self.main_frame = tk.Frame(
             self.root, bg=self.background_color, borderwidth=0, highlightthickness=0
@@ -242,6 +286,11 @@ class DesktopStickyNoteApp:
             label="Change font color", command=self.change_font_color
         )
         self.context_menu.add_checkbutton(
+            label="Launch at Windows startup",
+            variable=self.startup_enabled,
+            command=self.toggle_startup_launch,
+        )
+        self.context_menu.add_checkbutton(
             label="Pin to top",
             variable=self.pin_to_top_enabled,
             command=self.toggle_pin_to_top,
@@ -259,17 +308,41 @@ class DesktopStickyNoteApp:
         self.load_text()
         self.keep_window_bottom()
         self.apply_pin_to_top_state()
+        self.apply_startup_state()
         self.update_tray_icon()
 
         # Re-apply bottom z-order regularly so the note stays behind normal windows.
         self.root.after(250, self.bottom_tick)
         # Save shortly after edits.
         self.root.after(600, self.save_tick)
+        # Process tray click requests in Tk main thread.
+        self.root.after(50, self.process_pending_tray_actions)
 
     def hwnd(self) -> int:
         return int(self.root.winfo_id())
 
     def keep_window_bottom(self) -> None:
+        if self._force_hidden_by_tray:
+            ctypes.windll.user32.SetWindowPos(
+                self.hwnd(),
+                HWND_NOTOPMOST,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER,
+            )
+            ctypes.windll.user32.SetWindowPos(
+                self.hwnd(),
+                HWND_BOTTOM,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER,
+            )
+            return
+
         if self.pin_to_top_enabled.get():
             ctypes.windll.user32.SetWindowPos(
                 self.hwnd(),
@@ -448,6 +521,48 @@ class DesktopStickyNoteApp:
         self.update_tray_icon()
         self.save_config()
 
+    def get_startup_command(self) -> str:
+        if getattr(sys, "frozen", False):
+            return f'"{Path(sys.executable).resolve()}"'
+
+        script_path = Path(__file__).resolve()
+        python_exe = Path(sys.executable).resolve()
+        pythonw_exe = python_exe.with_name("pythonw.exe")
+        launcher = pythonw_exe if pythonw_exe.exists() else python_exe
+        return f'"{launcher}" "{script_path}"'
+
+    def apply_startup_state(self) -> None:
+        run_key_path = r"Software\Microsoft\Windows\CurrentVersion\Run"
+        value_name = "DesktopStickyNote"
+
+        try:
+            with winreg.OpenKey(
+                winreg.HKEY_CURRENT_USER,
+                run_key_path,
+                0,
+                winreg.KEY_SET_VALUE | winreg.KEY_QUERY_VALUE,
+            ) as key:
+                if self.startup_enabled.get():
+                    winreg.SetValueEx(
+                        key,
+                        value_name,
+                        0,
+                        winreg.REG_SZ,
+                        self.get_startup_command(),
+                    )
+                else:
+                    try:
+                        winreg.DeleteValue(key, value_name)
+                    except FileNotFoundError:
+                        pass
+        except OSError:
+            # Keep app running even if registry access fails.
+            return
+
+    def toggle_startup_launch(self) -> None:
+        self.apply_startup_state()
+        self.save_config()
+
     def apply_pin_to_top_state(self) -> None:
         if self.pin_to_top_enabled.get():
             self._keep_on_top_until = 0.0
@@ -478,25 +593,38 @@ class DesktopStickyNoteApp:
         self.apply_pin_to_top_state()
         self.save_config()
 
-    def show_note_from_tray_click(self) -> None:
-        # Temporarily keep the note on top so users can interact with it.
-        if self.pin_to_top_enabled.get():
+    def toggle_note_visibility_from_tray(self) -> None:
+        if self._force_hidden_by_tray:
+            self._force_hidden_by_tray = False
             self._keep_on_top_until = 0.0
+            self.root.deiconify()
+            self.root.update_idletasks()
+            ctypes.windll.user32.SetWindowPos(
+                self.hwnd(),
+                HWND_TOPMOST,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOOWNERZORDER,
+            )
+            self.root.lift()
+            ctypes.windll.user32.SetForegroundWindow(self.hwnd())
         else:
-            self._keep_on_top_until = time.monotonic() + 8.0
-        self.root.deiconify()
-        self.root.update_idletasks()
-        ctypes.windll.user32.SetWindowPos(
-            self.hwnd(),
-            HWND_TOPMOST,
-            0,
-            0,
-            0,
-            0,
-            SWP_NOMOVE | SWP_NOSIZE | SWP_NOOWNERZORDER,
-        )
-        self.root.lift()
-        ctypes.windll.user32.SetForegroundWindow(self.hwnd())
+            self._keep_on_top_until = 0.0
+            self._force_hidden_by_tray = True
+            self.keep_window_bottom()
+
+    def process_pending_tray_actions(self) -> None:
+        if self._pending_tray_left_click:
+            self._pending_tray_left_click = False
+            self.toggle_note_visibility_from_tray()
+
+        if self._pending_tray_right_click:
+            self._pending_tray_right_click = False
+            self.show_context_menu_from_tray()
+
+        self.root.after(50, self.process_pending_tray_actions)
 
     def install_window_proc_hook(self) -> None:
         user32 = ctypes.windll.user32
@@ -522,10 +650,10 @@ class DesktopStickyNoteApp:
 
         def custom_wndproc(hwnd_value, msg, wparam, lparam):
             if msg == WM_TRAYICON and lparam == WM_LBUTTONUP:
-                self.root.after(0, self.show_note_from_tray_click)
+                self._pending_tray_left_click = True
                 return 0
             if msg == WM_TRAYICON and lparam in {WM_RBUTTONUP, WM_CONTEXTMENU}:
-                self.root.after(0, self.show_context_menu_from_tray)
+                self._pending_tray_right_click = True
                 return 0
             return user32.CallWindowProcW(
                 self._original_wndproc, hwnd_value, msg, wparam, lparam
@@ -825,6 +953,10 @@ class DesktopStickyNoteApp:
         if isinstance(pin_to_top, bool):
             self.pin_to_top_enabled.set(pin_to_top)
 
+        startup = data.get("launch_at_startup")
+        if isinstance(startup, bool):
+            self.startup_enabled.set(startup)
+
         geometry = data.get("window_geometry")
         if isinstance(geometry, str) and "x" in geometry and "+" in geometry:
             self.window_geometry = geometry
@@ -835,9 +967,10 @@ class DesktopStickyNoteApp:
             "font_family": self.font_family,
             "font_size": self.font_size,
             "font_color": self.font_color,
+            "launch_at_startup": bool(self.startup_enabled.get()),
             "pin_to_top": bool(self.pin_to_top_enabled.get()),
             "show_tray_icon": bool(self.tray_icon_enabled.get()),
-            "window_geometry": self.root.geometry(),
+            "window_geometry": self.root.geometry(),           
         }
         try:
             self.config_path.write_text(
@@ -848,7 +981,14 @@ class DesktopStickyNoteApp:
             return
 
 
+def detach_console() -> None:
+    if getattr(sys, "frozen", False):
+        ctypes.windll.kernel32.FreeConsole()
+
+
 def main() -> None:
+    detach_console()
+    enable_dpi_awareness()
     root = tk.Tk()
     DesktopStickyNoteApp(root)
     root.mainloop()
