@@ -16,7 +16,7 @@ A lightweight, always-on-desktop sticky note for Windows. Built with Python and 
 
 ## Screenshot
 
-*(Place a screenshot here)*
+![app](https://github.com/user-attachments/assets/c24ab788-9cb2-49bd-8ee7-f82237430843)
 
 ## Requirements
 
