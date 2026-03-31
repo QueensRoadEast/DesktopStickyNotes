@@ -107,8 +107,13 @@ def app_base_dir() -> Path:
 
 
 def config_dir() -> Path:
-    d = app_base_dir() / "desktopStickNote_config"
+    d = app_base_dir() / ".desktopStickNote_config"
     d.mkdir(exist_ok=True)
+    if sys.platform == "win32":
+        try:
+            ctypes.windll.kernel32.SetFileAttributesW(str(d), 0x2)
+        except Exception:
+            pass
     return d
 
 
@@ -186,6 +191,10 @@ class DesktopStickyNoteApp:
         self.startup_enabled = tk.BooleanVar(value=True)
         self.pin_to_top_enabled = tk.BooleanVar(value=False)
         self.tray_icon_enabled = tk.BooleanVar(value=True)
+        self.dragger_pinned = tk.BooleanVar(value=False)
+        self.show_border = tk.BooleanVar(value=True)
+        self.drag_hover_distance = tk.IntVar(value=18)
+        self.tab_size = 4
         self.tray_icon_visible = False
         self.tray_hicon = None
         self.tray_hicon_shared = False
@@ -218,22 +227,29 @@ class DesktopStickyNoteApp:
         self.main_frame = tk.Frame(
             self.root, bg=self.background_color, borderwidth=0, highlightthickness=0
         )
-        self.main_frame.pack(fill="both", expand=True, pady=(10, 0))
+        self.main_frame.pack(fill="both", expand=True)
 
-        self.holder = tk.Frame(
+        self._holder_height = 14
+        self._holder_visible = False
+        self._holder_hover_zone = self.drag_hover_distance.get()
+        self.holder = tk.Canvas(
             self.root,
-            width=88,
-            height=8,
-            bg=shade_color(self.background_color),
-            borderwidth=0,
+            width=48,
+            height=self._holder_height,
+            bg=shade_color(self.background_color, 0.92),
             highlightthickness=0,
+            borderwidth=0,
             cursor="fleur",
         )
-        self.holder.place(relx=0.5, y=1, anchor="n")
+        self._draw_grip_dots()
+        self.holder.place(relx=0.5, y=-self._holder_height, anchor="n")
         self.holder.bind("<ButtonPress-1>", self.start_drag)
         self.holder.bind("<B1-Motion>", self.drag_window)
         self.holder.bind("<ButtonRelease-1>", self.finish_drag)
         self.holder.bind("<Button-3>", self.show_context_menu)
+        self.holder.bind("<Enter>", lambda e: self._cancel_holder_hide())
+        self.holder.bind("<Leave>", lambda e: None if self.dragger_pinned.get() else self._schedule_holder_hide())
+        self.root.bind("<Motion>", self._on_root_motion)
 
         self.text = tk.Text(
             self.main_frame,
@@ -258,6 +274,7 @@ class DesktopStickyNoteApp:
             selectforeground="#111111",
         )
         self.text.pack(side="left", fill="both", expand=True)
+        self._apply_tab_size()
 
         self.text.bind("<<Modified>>", self.on_text_modified)
         self.text.bind("<Button-3>", self.show_context_menu)
@@ -268,7 +285,6 @@ class DesktopStickyNoteApp:
         self.root.bind("<FocusIn>", self.defer_bottom_refresh)
         self.root.bind("<Map>", self.defer_bottom_refresh)
         self.root.bind("<Configure>", self.defer_bottom_refresh)
-        self.root.bind("<Motion>", self.on_resize_motion)
         self.root.bind("<ButtonPress-1>", self.on_resize_press)
         self.root.bind("<B1-Motion>", self.on_resize_drag)
         self.root.bind("<ButtonRelease-1>", self.on_resize_release)
@@ -276,32 +292,11 @@ class DesktopStickyNoteApp:
 
         self.context_menu = tk.Menu(self.root, tearoff=0)
         self.context_menu.add_command(
-            label="Change background color", command=self.change_background_color
-        )
-        self.context_menu.add_command(
-            label="Change font size", command=self.change_font_size
-        )
-        self.context_menu.add_command(label="Change font", command=self.change_font)
-        self.context_menu.add_command(
-            label="Change font color", command=self.change_font_color
-        )
-        self.context_menu.add_checkbutton(
-            label="Launch at Windows startup",
-            variable=self.startup_enabled,
-            command=self.toggle_startup_launch,
-        )
-        self.context_menu.add_checkbutton(
-            label="Pin to top",
-            variable=self.pin_to_top_enabled,
-            command=self.toggle_pin_to_top,
-        )
-        self.context_menu.add_checkbutton(
-            label="Show taskbar tray icon",
-            variable=self.tray_icon_enabled,
-            command=self.toggle_tray_icon,
+            label="Settings\u2026", command=self.open_settings_window
         )
         self.context_menu.add_separator()
         self.context_menu.add_command(label="Exit", command=self.on_close)
+        self._settings_win: tk.Toplevel | None = None
 
         self.install_window_proc_hook()
         self.apply_window_logo()
@@ -310,6 +305,9 @@ class DesktopStickyNoteApp:
         self.apply_pin_to_top_state()
         self.apply_startup_state()
         self.update_tray_icon()
+        if self.dragger_pinned.get():
+            self._show_holder()
+        self.apply_border_state()
 
         # Re-apply bottom z-order regularly so the note stays behind normal windows.
         self.root.after(250, self.bottom_tick)
@@ -320,6 +318,73 @@ class DesktopStickyNoteApp:
 
     def hwnd(self) -> int:
         return int(self.root.winfo_id())
+
+    def _draw_grip_dots(self) -> None:
+        self.holder.delete("dots")
+        dot_color = shade_color(self.background_color, 0.55)
+        cols, rows = 4, 2
+        dot_r = 1.5
+        spacing_x, spacing_y = 8, 5
+        total_w = (cols - 1) * spacing_x
+        total_h = (rows - 1) * spacing_y
+        cx = 24
+        cy = self._holder_height / 2
+        for r in range(rows):
+            for c in range(cols):
+                x = cx - total_w / 2 + c * spacing_x
+                y = cy - total_h / 2 + r * spacing_y
+                self.holder.create_oval(
+                    x - dot_r, y - dot_r, x + dot_r, y + dot_r,
+                    fill=dot_color, outline="", tags="dots",
+                )
+
+    def _on_root_motion(self, event: tk.Event) -> None:
+        if self._is_resizing:
+            return
+        direction = self.get_resize_direction(event.x_root, event.y_root)
+        self.apply_resize_cursor(direction)
+        if self.dragger_pinned.get():
+            return
+        y_in_window = event.y_root - self.root.winfo_y()
+        if y_in_window <= self._holder_hover_zone and not self._holder_visible:
+            self._show_holder()
+        elif y_in_window > self._holder_hover_zone + self._holder_height + 4:
+            if self._holder_visible:
+                self._schedule_holder_hide()
+
+    def _show_holder(self) -> None:
+        self._holder_visible = True
+        self._cancel_holder_hide()
+        self._animate_holder(target_y=0)
+
+    def _schedule_holder_hide(self) -> None:
+        self._cancel_holder_hide()
+        self._holder_hide_id = self.root.after(350, self._hide_holder)
+
+    def _cancel_holder_hide(self) -> None:
+        hid = getattr(self, "_holder_hide_id", None)
+        if hid:
+            self.root.after_cancel(hid)
+            self._holder_hide_id = None
+
+    def _hide_holder(self) -> None:
+        if self.dragger_pinned.get():
+            return
+        self._holder_visible = False
+        self._animate_holder(target_y=-self._holder_height)
+
+    def _animate_holder(self, target_y: int) -> None:
+        info = self.holder.place_info()
+        current_y = int(info.get("y", 0))
+        if current_y == target_y:
+            return
+        step = 2 if target_y > current_y else -2
+        new_y = current_y + step
+        if (step > 0 and new_y > target_y) or (step < 0 and new_y < target_y):
+            new_y = target_y
+        self.holder.place(relx=0.5, y=new_y, anchor="n")
+        if new_y != target_y:
+            self.root.after(12, self._animate_holder, target_y)
 
     def keep_window_bottom(self) -> None:
         if self._force_hidden_by_tray:
@@ -414,6 +479,204 @@ class DesktopStickyNoteApp:
         cursor = wintypes.POINT()
         ctypes.windll.user32.GetCursorPos(ctypes.byref(cursor))
         self.show_context_menu_at(cursor.x, cursor.y)
+
+    def open_settings_window(self) -> None:
+        if self._settings_win and self._settings_win.winfo_exists():
+            self._settings_win.lift()
+            self._settings_win.focus_force()
+            return
+
+        win = tk.Toplevel(self.root)
+        self._settings_win = win
+        win.title("Settings")
+        win.resizable(False, False)
+        win.configure(bg="#F5F5F5")
+        win.attributes("-topmost", True)
+
+        pad = {"padx": 12, "pady": 4}
+        section_pad = {"padx": 12, "pady": (12, 2)}
+        row = 0
+
+        # -- Appearance -------------------------------------------------------
+        tk.Label(
+            win, text="Appearance", font=("Segoe UI", 10, "bold"),
+            bg="#F5F5F5", anchor="w",
+        ).grid(row=row, column=0, columnspan=3, sticky="w", **section_pad)
+        row += 1
+
+        tk.Label(win, text="Background color", bg="#F5F5F5").grid(
+            row=row, column=0, sticky="w", **pad,
+        )
+        self._sw_bg_preview = tk.Frame(
+            win, width=28, height=18, bg=self.background_color,
+            highlightthickness=1, highlightbackground="#999",
+        )
+        self._sw_bg_preview.grid(row=row, column=1, **pad)
+        tk.Button(
+            win, text="Pick\u2026", width=6, command=self._sw_pick_bg_color,
+        ).grid(row=row, column=2, **pad)
+        row += 1
+
+        tk.Label(win, text="Font color", bg="#F5F5F5").grid(
+            row=row, column=0, sticky="w", **pad,
+        )
+        self._sw_fc_preview = tk.Frame(
+            win, width=28, height=18, bg=self.font_color,
+            highlightthickness=1, highlightbackground="#999",
+        )
+        self._sw_fc_preview.grid(row=row, column=1, **pad)
+        tk.Button(
+            win, text="Pick\u2026", width=6, command=self._sw_pick_font_color,
+        ).grid(row=row, column=2, **pad)
+        row += 1
+
+        # -- Font -------------------------------------------------------------
+        tk.Label(
+            win, text="Font", font=("Segoe UI", 10, "bold"),
+            bg="#F5F5F5", anchor="w",
+        ).grid(row=row, column=0, columnspan=3, sticky="w", **section_pad)
+        row += 1
+
+        tk.Label(win, text="Family", bg="#F5F5F5").grid(
+            row=row, column=0, sticky="w", **pad,
+        )
+        self._sw_font_var = tk.StringVar(value=self.font_family)
+        families = sorted(set(tkfont.families()))
+        font_combo = tk.OptionMenu(win, self._sw_font_var, *families)
+        font_combo.configure(width=18)
+        font_combo.grid(row=row, column=1, columnspan=2, sticky="w", **pad)
+        self._sw_font_var.trace_add("write", lambda *_: self._sw_apply_font())
+        row += 1
+
+        tk.Label(win, text="Size", bg="#F5F5F5").grid(
+            row=row, column=0, sticky="w", **pad,
+        )
+        self._sw_size_var = tk.IntVar(value=self.font_size)
+        size_spin = tk.Spinbox(
+            win, from_=8, to=72, width=5, textvariable=self._sw_size_var,
+            command=self._sw_apply_font_size,
+        )
+        size_spin.grid(row=row, column=1, sticky="w", **pad)
+        size_spin.bind("<Return>", lambda e: self._sw_apply_font_size())
+        row += 1
+
+        tk.Label(win, text="Tab size", bg="#F5F5F5").grid(
+            row=row, column=0, sticky="w", **pad,
+        )
+        self._sw_tab_var = tk.IntVar(value=self.tab_size)
+        tab_spin = tk.Spinbox(
+            win, from_=1, to=16, width=5, textvariable=self._sw_tab_var,
+            command=self._sw_apply_tab_size,
+        )
+        tab_spin.grid(row=row, column=1, sticky="w", **pad)
+        tab_spin.bind("<Return>", lambda e: self._sw_apply_tab_size())
+        row += 1
+
+        # -- Behaviour --------------------------------------------------------
+        tk.Label(
+            win, text="Behaviour", font=("Segoe UI", 10, "bold"),
+            bg="#F5F5F5", anchor="w",
+        ).grid(row=row, column=0, columnspan=3, sticky="w", **section_pad)
+        row += 1
+
+        tk.Checkbutton(
+            win, text="Launch at Windows startup", bg="#F5F5F5",
+            variable=self.startup_enabled, command=self.toggle_startup_launch,
+        ).grid(row=row, column=0, columnspan=3, sticky="w", **pad)
+        row += 1
+
+        tk.Checkbutton(
+            win, text="Pin to top", bg="#F5F5F5",
+            variable=self.pin_to_top_enabled, command=self.toggle_pin_to_top,
+        ).grid(row=row, column=0, columnspan=3, sticky="w", **pad)
+        row += 1
+
+        tk.Checkbutton(
+            win, text="Show taskbar tray icon", bg="#F5F5F5",
+            variable=self.tray_icon_enabled, command=self.toggle_tray_icon,
+        ).grid(row=row, column=0, columnspan=3, sticky="w", **pad)
+        row += 1
+
+        tk.Checkbutton(
+            win, text="Pin drag handle", bg="#F5F5F5",
+            variable=self.dragger_pinned, command=self.toggle_dragger_pinned,
+        ).grid(row=row, column=0, columnspan=3, sticky="w", **pad)
+        row += 1
+
+        tk.Checkbutton(
+            win, text="Show border", bg="#F5F5F5",
+            variable=self.show_border, command=self.toggle_border,
+        ).grid(row=row, column=0, columnspan=3, sticky="w", **pad)
+        row += 1
+
+        # Bottom padding
+        tk.Frame(win, height=8, bg="#F5F5F5").grid(
+            row=row, column=0, columnspan=3,
+        )
+
+        win.update_idletasks()
+        wx = self.root.winfo_x() + self.root.winfo_width() + 8
+        wy = self.root.winfo_y()
+        win.geometry(f"+{wx}+{wy}")
+
+    def _sw_pick_bg_color(self) -> None:
+        _, color_hex = colorchooser.askcolor(
+            color=self.background_color, parent=self._settings_win,
+        )
+        if not color_hex:
+            return
+        self.background_color = color_hex
+        self.selection_color = blend_colors(self.background_color, "#000000", 0.20)
+        self.root.configure(bg=self.background_color)
+        self.main_frame.configure(bg=self.background_color)
+        self.holder.configure(bg=shade_color(self.background_color, 0.92))
+        self._draw_grip_dots()
+        self.text.configure(
+            bg=self.background_color,
+            selectbackground=self.selection_color,
+            inactiveselectbackground=self.selection_color,
+        )
+        self.apply_border_state()
+        self._sw_bg_preview.configure(bg=self.background_color)
+        self.text_changed = True
+        self.save_config()
+
+    def _sw_pick_font_color(self) -> None:
+        _, color_hex = colorchooser.askcolor(
+            color=self.font_color, parent=self._settings_win,
+        )
+        if not color_hex:
+            return
+        self.font_color = color_hex
+        self.text.configure(fg=self.font_color, insertbackground=self.font_color)
+        self._sw_fc_preview.configure(bg=self.font_color)
+        self.text_changed = True
+        self.save_config()
+
+    def _sw_apply_font(self) -> None:
+        chosen = self._sw_font_var.get()
+        if chosen and chosen in set(tkfont.families()):
+            self.font_family = chosen
+            self.apply_text_font()
+
+    def _sw_apply_font_size(self) -> None:
+        try:
+            val = self._sw_size_var.get()
+        except (tk.TclError, ValueError):
+            return
+        if 8 <= val <= 72:
+            self.font_size = val
+            self.apply_text_font()
+
+    def _sw_apply_tab_size(self) -> None:
+        try:
+            val = self._sw_tab_var.get()
+        except (tk.TclError, ValueError):
+            return
+        if 1 <= val <= 16:
+            self.tab_size = val
+            self._apply_tab_size()
+            self.save_config()
 
     def apply_window_logo(self) -> None:
         if not self.logo_png_path.exists():
@@ -519,6 +782,53 @@ class DesktopStickyNoteApp:
 
     def toggle_tray_icon(self) -> None:
         self.update_tray_icon()
+        self.save_config()
+
+    def toggle_dragger_pinned(self) -> None:
+        if self.dragger_pinned.get():
+            self._show_holder()
+        else:
+            self._schedule_holder_hide()
+        self.save_config()
+
+    def apply_border_state(self) -> None:
+        if self.show_border.get():
+            border_color = shade_color(self.background_color, 0.65)
+            self.text.configure(
+                relief="solid", borderwidth=1,
+                highlightthickness=1,
+                highlightcolor=border_color,
+                highlightbackground=border_color,
+            )
+        else:
+            self.text.configure(
+                relief="flat", borderwidth=0,
+                highlightthickness=0,
+            )
+
+    def toggle_border(self) -> None:
+        self.apply_border_state()
+        self.save_config()
+
+    def _apply_tab_size(self) -> None:
+        space_width = tkfont.Font(
+            family=self.font_family, size=self.font_size
+        ).measure(" ")
+        self.text.configure(tabs=(space_width * self.tab_size,))
+
+    def change_tab_size(self) -> None:
+        new_size = simpledialog.askinteger(
+            "Tab Size",
+            "Enter tab width in spaces (1-16):",
+            initialvalue=self.tab_size,
+            minvalue=1,
+            maxvalue=16,
+            parent=self.root,
+        )
+        if not new_size:
+            return
+        self.tab_size = new_size
+        self._apply_tab_size()
         self.save_config()
 
     def get_startup_command(self) -> str:
@@ -813,20 +1123,20 @@ class DesktopStickyNoteApp:
         self.selection_color = blend_colors(self.background_color, "#000000", 0.20)
         self.root.configure(bg=self.background_color)
         self.main_frame.configure(bg=self.background_color)
-        self.holder.configure(bg=shade_color(self.background_color))
-        text_border = shade_color(self.background_color, 0.65)
+        self.holder.configure(bg=shade_color(self.background_color, 0.92))
+        self._draw_grip_dots()
         self.text.configure(
             bg=self.background_color,
-            highlightcolor=text_border,
-            highlightbackground=text_border,
             selectbackground=self.selection_color,
             inactiveselectbackground=self.selection_color,
         )
+        self.apply_border_state()
         self.text_changed = True
         self.save_config()
 
     def apply_text_font(self) -> None:
         self.text.configure(font=(self.font_family, self.font_size))
+        self._apply_tab_size()
         self.text_changed = True
         self.save_config()
 
@@ -961,6 +1271,18 @@ class DesktopStickyNoteApp:
         if isinstance(geometry, str) and "x" in geometry and "+" in geometry:
             self.window_geometry = geometry
 
+        dragger_pin = data.get("dragger_pinned")
+        if isinstance(dragger_pin, bool):
+            self.dragger_pinned.set(dragger_pin)
+
+        border = data.get("show_border")
+        if isinstance(border, bool):
+            self.show_border.set(border)
+
+        tab = data.get("tab_size")
+        if isinstance(tab, int) and 1 <= tab <= 16:
+            self.tab_size = tab
+
     def save_config(self) -> None:
         config = {
             "background_color": self.background_color,
@@ -970,7 +1292,10 @@ class DesktopStickyNoteApp:
             "launch_at_startup": bool(self.startup_enabled.get()),
             "pin_to_top": bool(self.pin_to_top_enabled.get()),
             "show_tray_icon": bool(self.tray_icon_enabled.get()),
-            "window_geometry": self.root.geometry(),           
+            "window_geometry": self.root.geometry(),
+            "dragger_pinned": bool(self.dragger_pinned.get()),
+            "show_border": bool(self.show_border.get()),
+            "tab_size": self.tab_size,
         }
         try:
             self.config_path.write_text(
@@ -981,13 +1306,7 @@ class DesktopStickyNoteApp:
             return
 
 
-def detach_console() -> None:
-    if getattr(sys, "frozen", False):
-        ctypes.windll.kernel32.FreeConsole()
-
-
 def main() -> None:
-    detach_console()
     enable_dpi_awareness()
     root = tk.Tk()
     DesktopStickyNoteApp(root)
