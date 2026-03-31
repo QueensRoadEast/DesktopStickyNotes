@@ -1,0 +1,14 @@
+# Environments
+.venv/
+env/
+.cursor/
+
+# Python build artifacts
+__pycache__/
+build/
+dist/
+*.spec
+*.pyc
+
+# Local config (if you don't want to share your settings)
+sticky_note_config.json

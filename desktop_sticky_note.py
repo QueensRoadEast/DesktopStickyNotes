@@ -1,6 +1,8 @@
 import ctypes
+import datetime
 import json
 import time
+import traceback
 import tkinter as tk
 from pathlib import Path
 import sys
@@ -183,6 +185,7 @@ class DesktopStickyNoteApp:
         self.config_path = config_storage_path()
         self.logo_png_path = config_dir() / "logo.png"
         self.logo_ico_path = config_dir() / "logo.ico"
+        self._register_custom_fonts()
         self.font_family = pick_default_font_family()
         self.font_size = 13
         self.font_color = "#1A1A1A"
@@ -538,14 +541,42 @@ class DesktopStickyNoteApp:
         row += 1
 
         tk.Label(win, text="Family", bg="#F5F5F5").grid(
-            row=row, column=0, sticky="w", **pad,
+            row=row, column=0, sticky="w", padx=12, pady=(4, 0),
         )
-        self._sw_font_var = tk.StringVar(value=self.font_family)
-        families = sorted(set(tkfont.families()))
-        font_combo = tk.OptionMenu(win, self._sw_font_var, *families)
-        font_combo.configure(width=18)
-        font_combo.grid(row=row, column=1, columnspan=2, sticky="w", **pad)
-        self._sw_font_var.trace_add("write", lambda *_: self._sw_apply_font())
+        tk.Button(
+            win, text="Load .ttf\u2026", width=8, command=self._sw_load_ttf,
+        ).grid(row=row, column=2, sticky="e", padx=12, pady=(4, 0))
+        row += 1
+
+        font_frame = tk.Frame(win, bg="#F5F5F5")
+        font_frame.grid(row=row, column=0, columnspan=3, sticky="we", **pad)
+        font_frame.columnconfigure(0, weight=1)
+
+        self._sw_font_search_var = tk.StringVar()
+        font_search = tk.Entry(
+            font_frame, textvariable=self._sw_font_search_var, width=28,
+        )
+        font_search.pack(fill="x", pady=(0, 2))
+        font_search.insert(0, self.font_family)
+        self._sw_font_search_var.trace_add("write", lambda *_: self._sw_filter_fonts())
+
+        list_frame = tk.Frame(font_frame)
+        list_frame.pack(fill="x")
+        font_scroll = tk.Scrollbar(list_frame, orient="vertical")
+        self._sw_font_list = tk.Listbox(
+            list_frame, height=6, width=28,
+            yscrollcommand=font_scroll.set, exportselection=False,
+        )
+        font_scroll.configure(command=self._sw_font_list.yview)
+        self._sw_font_list.pack(side="left", fill="x", expand=True)
+        font_scroll.pack(side="right", fill="y")
+
+        self._sw_all_families = sorted(set(tkfont.families()))
+        self._sw_populate_font_list(self._sw_all_families)
+        self._sw_select_font_in_list(self.font_family)
+
+        self._sw_font_list.bind("<<ListboxSelect>>", self._sw_on_font_select)
+        self._sw_font_list.bind("<MouseWheel>", self._sw_on_font_wheel)
         row += 1
 
         tk.Label(win, text="Size", bg="#F5F5F5").grid(
@@ -603,6 +634,18 @@ class DesktopStickyNoteApp:
         ).grid(row=row, column=0, columnspan=3, sticky="w", **pad)
         row += 1
 
+        tk.Label(win, text="Drag handle reveal distance", bg="#F5F5F5").grid(
+            row=row, column=0, sticky="w", **pad,
+        )
+        hover_slider = tk.Scale(
+            win, from_=5, to=80, orient="horizontal",
+            variable=self.drag_hover_distance,
+            bg="#F5F5F5", highlightthickness=0, length=140,
+            command=lambda _: self._on_hover_distance_changed(),
+        )
+        hover_slider.grid(row=row, column=1, columnspan=2, sticky="w", **pad)
+        row += 1
+
         tk.Checkbutton(
             win, text="Show border", bg="#F5F5F5",
             variable=self.show_border, command=self.toggle_border,
@@ -653,11 +696,108 @@ class DesktopStickyNoteApp:
         self.text_changed = True
         self.save_config()
 
-    def _sw_apply_font(self) -> None:
-        chosen = self._sw_font_var.get()
+    def _sw_populate_font_list(self, families: list[str]) -> None:
+        self._sw_font_list.delete(0, "end")
+        for f in families:
+            self._sw_font_list.insert("end", f)
+
+    def _sw_select_font_in_list(self, name: str) -> None:
+        items = self._sw_font_list.get(0, "end")
+        for i, item in enumerate(items):
+            if item == name:
+                self._sw_font_list.selection_clear(0, "end")
+                self._sw_font_list.selection_set(i)
+                self._sw_font_list.see(i)
+                return
+
+    def _sw_filter_fonts(self) -> None:
+        query = self._sw_font_search_var.get().lower()
+        if not query:
+            filtered = self._sw_all_families
+        else:
+            filtered = [f for f in self._sw_all_families if query in f.lower()]
+        self._sw_populate_font_list(filtered)
+        if filtered:
+            self._sw_font_list.selection_set(0)
+
+    def _sw_on_font_select(self, _event: tk.Event) -> None:
+        sel = self._sw_font_list.curselection()
+        if not sel:
+            return
+        chosen = self._sw_font_list.get(sel[0])
         if chosen and chosen in set(tkfont.families()):
             self.font_family = chosen
             self.apply_text_font()
+
+    def _sw_on_font_wheel(self, event: tk.Event) -> None:
+        self._sw_font_list.yview_scroll(-1 * (event.delta // 120), "units")
+
+    def _sw_load_ttf(self) -> None:
+        from tkinter import filedialog
+        import shutil
+        path = filedialog.askopenfilename(
+            title="Select a .ttf font file",
+            filetypes=[("TrueType Font", "*.ttf"), ("OpenType Font", "*.otf")],
+            parent=self._settings_win,
+        )
+        if not path:
+            return
+        src = Path(path)
+        dest = config_dir() / src.name
+        shutil.copy2(src, dest)
+
+        gdi32 = ctypes.windll.gdi32
+        added = gdi32.AddFontResourceW(str(dest))
+        if added:
+            HWND_BROADCAST = 0xFFFF
+            WM_FONTCHANGE = 0x001D
+            ctypes.windll.user32.SendMessageW(
+                HWND_BROADCAST, WM_FONTCHANGE, 0, 0,
+            )
+
+        custom = self._load_custom_font_list()
+        if str(dest) not in custom:
+            custom.append(str(dest))
+            self._save_custom_font_list(custom)
+
+        self._sw_all_families = sorted(set(tkfont.families()))
+        self._sw_filter_fonts()
+
+    def _custom_fonts_path(self) -> Path:
+        return config_dir() / "custom_fonts.json"
+
+    def _load_custom_font_list(self) -> list[str]:
+        p = self._custom_fonts_path()
+        if not p.exists():
+            return []
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+            return data if isinstance(data, list) else []
+        except (OSError, json.JSONDecodeError):
+            return []
+
+    def _save_custom_font_list(self, fonts: list[str]) -> None:
+        try:
+            self._custom_fonts_path().write_text(
+                json.dumps(fonts, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        except OSError:
+            pass
+
+    def _register_custom_fonts(self) -> None:
+        gdi32 = ctypes.windll.gdi32
+        for font_path in self._load_custom_font_list():
+            if Path(font_path).exists():
+                gdi32.AddFontResourceW(font_path)
+
+    def _sw_apply_font(self) -> None:
+        chosen = getattr(self, "_sw_font_var", None)
+        if chosen:
+            val = chosen.get()
+            if val and val in set(tkfont.families()):
+                self.font_family = val
+                self.apply_text_font()
 
     def _sw_apply_font_size(self) -> None:
         try:
@@ -789,6 +929,10 @@ class DesktopStickyNoteApp:
             self._show_holder()
         else:
             self._schedule_holder_hide()
+        self.save_config()
+
+    def _on_hover_distance_changed(self, *_args) -> None:
+        self._holder_hover_zone = self.drag_hover_distance.get()
         self.save_config()
 
     def apply_border_state(self) -> None:
@@ -1226,7 +1370,14 @@ class DesktopStickyNoteApp:
         self.save_config()
         self.remove_tray_icon()
         self.uninstall_window_proc_hook()
+        self._unregister_custom_fonts()
         self.root.destroy()
+
+    def _unregister_custom_fonts(self) -> None:
+        gdi32 = ctypes.windll.gdi32
+        for font_path in self._load_custom_font_list():
+            if Path(font_path).exists():
+                gdi32.RemoveFontResourceW(font_path)
 
     def load_config(self) -> None:
         if not self.config_path.exists():
@@ -1279,6 +1430,10 @@ class DesktopStickyNoteApp:
         if isinstance(border, bool):
             self.show_border.set(border)
 
+        hover_dist = data.get("drag_hover_distance")
+        if isinstance(hover_dist, int) and 5 <= hover_dist <= 80:
+            self.drag_hover_distance.set(hover_dist)
+
         tab = data.get("tab_size")
         if isinstance(tab, int) and 1 <= tab <= 16:
             self.tab_size = tab
@@ -1295,6 +1450,7 @@ class DesktopStickyNoteApp:
             "window_geometry": self.root.geometry(),
             "dragger_pinned": bool(self.dragger_pinned.get()),
             "show_border": bool(self.show_border.get()),
+            "drag_hover_distance": self.drag_hover_distance.get(),
             "tab_size": self.tab_size,
         }
         try:
@@ -1306,12 +1462,67 @@ class DesktopStickyNoteApp:
             return
 
 
+_clean_exit = False
+
+
+def write_crash_log(exc: BaseException) -> Path:
+    log_dir = config_dir() / "log"
+    log_dir.mkdir(exist_ok=True)
+    stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_file = log_dir / f"crash_{stamp}.log"
+    lines = [
+        f"Crash at: {datetime.datetime.now().isoformat()}",
+        f"Python: {sys.version}",
+        f"Executable: {sys.executable}",
+        f"Frozen: {getattr(sys, 'frozen', False)}",
+        "",
+        "Traceback:",
+        traceback.format_exc(),
+    ]
+    log_file.write_text("\n".join(lines), encoding="utf-8")
+    return log_file
+
+
+def show_crash_dialog(log_file: Path) -> None:
+    try:
+        import tkinter as _tk
+        from tkinter import messagebox as _mb
+        _r = _tk.Tk()
+        _r.withdraw()
+        _mb.showerror(
+            "Desktop Sticky Note - Crash",
+            f"The application crashed unexpectedly.\n\n"
+            f"A crash log has been saved to:\n{log_file}",
+        )
+        _r.destroy()
+    except Exception:
+        pass
+
+
 def main() -> None:
+    global _clean_exit
     enable_dpi_awareness()
     root = tk.Tk()
-    DesktopStickyNoteApp(root)
+    app = DesktopStickyNoteApp(root)
+
+    _orig_on_close = app.on_close
+    def patched_on_close():
+        global _clean_exit
+        _clean_exit = True
+        _orig_on_close()
+    app.on_close = patched_on_close
+    root.protocol("WM_DELETE_WINDOW", patched_on_close)
+
     root.mainloop()
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except SystemExit:
+        pass
+    except BaseException as exc:
+        if not _clean_exit:
+            log_file = write_crash_log(exc)
+            show_crash_dialog(log_file)
+        raise
